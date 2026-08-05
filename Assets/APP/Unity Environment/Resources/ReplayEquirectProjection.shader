@@ -3,7 +3,6 @@ Shader "Replay/EquirectProjection"
 	Properties
 	{
 		_Cube ("Cubemap", CUBE) = "" {}
-		_Rotation ("Rotation", Matrix) = "identity"
 		_UVCoverage ("UV Coverage", Vector) = (6.283185307, 3.141592654, 0, 0)
 	}
 	SubShader
@@ -16,6 +15,8 @@ Shader "Replay/EquirectProjection"
 			CGPROGRAM
 			#pragma vertex vert
 			#pragma fragment frag
+
+			#pragma multi_compile _ FLIP
 
 			#include "UnityCG.cginc"
 
@@ -71,6 +72,10 @@ Shader "Replay/EquirectProjection"
 				dir = mul(mat, dir);
 
 				dir = mul((float3x3)_Rotation, dir);
+
+#ifdef FLIP
+				dir *= -1;
+#endif
 
 				return texCUBE(_Cube, dir);
 			}

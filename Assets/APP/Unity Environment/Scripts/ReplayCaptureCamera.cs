@@ -31,8 +31,10 @@ public class ReplayCaptureCamera : MonoBehaviour
     RenderTexture _cubeRT;
     RenderTexture _outputRT;
     Material _projectMat;
+    Material _projectMat180;
     int _cubeId;
     int _rotationId;
+    int _uvScaleId;
     int _lastVersion = -1;
     int _width = -1;
     int _height = -1;
@@ -72,6 +74,7 @@ public class ReplayCaptureCamera : MonoBehaviour
 
         _cubeId = Shader.PropertyToID("_Cube");
         _rotationId = Shader.PropertyToID("_Rotation");
+        _uvScaleId = Shader.PropertyToID("_UVCoverage");
 
         // Prefer the renderer's production projection material (EquirectangularProjection.mat
         // -> CubemapProjection.shader, FLIP enabled) — the exact path the built-in Camera360 uses.
@@ -90,6 +93,18 @@ public class ReplayCaptureCamera : MonoBehaviour
         }
         if (_projectMat != null)
             _projectMat.EnableKeyword("FLIP");
+
+        // 180 material: Replay/EquirectProjection with _UVCoverage for the front hemisphere.
+        var replayShader = Resources.Load<Shader>("ReplayEquirectProjection");
+        if (replayShader == null)
+        {
+            Debug.LogError("[ReplayCapture] Shader Replay/EquirectProjection not found in resources");
+        }
+        else
+        {
+            _projectMat180 = new Material(replayShader);
+            _projectMat180.EnableKeyword("FLIP");
+        }
 
         StartCoroutine(CaptureLoop());
     }
@@ -276,13 +291,19 @@ public class ReplayCaptureCamera : MonoBehaviour
         try
         {
             int cubeSize = _cubeRT.width;
-            bool haveMat = _projectMat != null;
+
+            // Pick the projection material: 180 uses Replay/EquirectProjection with the
+            // front-hemisphere _UVCoverage; 360 uses the production material.
+            var projMat = projection == ProjectionEquirect180 ? _projectMat180 : _projectMat;
+            bool haveMat = projMat != null;
 
             // Material setup before rendering, matching production Camera360.RenderCubemap.
             if (haveMat)
             {
-                _projectMat.SetTexture(_cubeId, _cubeRT);
-                _projectMat.SetMatrix(_rotationId, Matrix4x4.TRS(Vector3.zero, prevRot, Vector3.one));
+                if (projection == ProjectionEquirect180)
+                    projMat.SetVector(_uvScaleId, new Vector4(Mathf.PI, Mathf.PI, -0.5f, 0f));
+                projMat.SetTexture(_cubeId, _cubeRT);
+                projMat.SetMatrix(_rotationId, Matrix4x4.TRS(Vector3.zero, prevRot, Vector3.one));
             }
 
             var faceRT = RenderTexture.GetTemporary(cubeSize, cubeSize, 24, _cubeRT.format);
@@ -309,7 +330,7 @@ public class ReplayCaptureCamera : MonoBehaviour
             RenderTexture.active = _outputRT;
             GL.Clear(true, true, Color.black);
             if (haveMat)
-                Graphics.Blit(Texture2D.whiteTexture, _outputRT, _projectMat);
+                Graphics.Blit(Texture2D.whiteTexture, _outputRT, projMat);
             _readbackTex.ReadPixels(new Rect(0, 0, width, height), 0, 0, false);
         }
         finally
@@ -352,5 +373,6 @@ public class ReplayCaptureCamera : MonoBehaviour
         if (_cubeRT != null) Destroy(_cubeRT);
         if (_outputRT != null) Destroy(_outputRT);
         if (_projectMat != null) Destroy(_projectMat);
+        if (_projectMat180 != null) Destroy(_projectMat180);
     }
 }
