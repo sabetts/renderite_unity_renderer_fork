@@ -1,5 +1,6 @@
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using Renderite.Shared;
 using Renderite.Unity;
@@ -20,11 +21,17 @@ public class ReplayCaptureCamera : MonoBehaviour
 {
     const int ControlBufferId = int.MaxValue - 2;
     const int RenderBufferId = int.MaxValue - 1;
+    const int DepthBufferId = int.MaxValue - 3;
     const int ControlBlockSize = 64;
 
     const int ProjectionPerspective = 0;
     const int ProjectionEquirect360 = 1;
     const int ProjectionEquirect180 = 2;
+
+    // depthOutput control-block values
+    const int DepthOutputNone = 0;
+    const int DepthOutputDepthOnly = 1;
+    const int DepthOutputBoth = 2;
 
     Camera _camera;
     Texture2D _readbackTex;
@@ -39,6 +46,16 @@ public class ReplayCaptureCamera : MonoBehaviour
     int _width = -1;
     int _height = -1;
     bool _diagLogged;
+    int _captureFrames;
+
+    // Depth output: render the scene with a replacement shader that outputs Linear01Depth,
+    // then (for equirect) project the depth cubemap to a panorama.
+    RenderTexture _depthRT;
+    RenderTexture _depthCubeRT;
+    RenderTexture _depthOutputRT;
+    Material _depthReplacementMat;
+    Texture2D _depthReadbackTex;
+    int _depthOutput;
 
     // Camera rotation (euler angles) per cubemap face so each face can be rendered
     // with a plain Camera.Render() call (RenderToCubemap is unreliable in this player).
@@ -68,6 +85,7 @@ public class ReplayCaptureCamera : MonoBehaviour
         _camera = camGo.AddComponent<Camera>();
         _camera.enabled = false;
         _camera.stereoTargetEye = StereoTargetEyeMask.None;
+        _camera.depthTextureMode = DepthTextureMode.Depth;
         // Mirror the renderer's on-screen camera (CameraInitializer.cs): everything
         // except Hidden/Overlay, i.e. Default + Temp + Private are all visible.
         _camera.cullingMask = ~LayerMask.GetMask(RenderHelper.HIDDEN_LAYER, RenderHelper.OVERLAY_LAYER);
@@ -106,6 +124,18 @@ public class ReplayCaptureCamera : MonoBehaviour
             _projectMat180.EnableKeyword("FLIP");
         }
 
+        // Depth replacement shader: renders all scene objects with a shader that outputs
+        // Linear01Depth, independent of the materials the scene actually uses.
+        var depthShader = Resources.Load<Shader>("ReplayDepthReplacement");
+        if (depthShader == null)
+        {
+            Debug.LogError("[ReplayCapture] Shader ReplayDepthReplacement not found in resources");
+        }
+        else
+        {
+            _depthReplacementMat = new Material(depthShader);
+        }
+
         StartCoroutine(CaptureLoop());
     }
 
@@ -141,6 +171,7 @@ public class ReplayCaptureCamera : MonoBehaviour
                 float near = MemoryMarshal.Read<float>(control.Slice(48, 4));
                 float far = MemoryMarshal.Read<float>(control.Slice(52, 4));
                 int clearMode = MemoryMarshal.Read<int>(control.Slice(56, 4));
+                _depthOutput = MemoryMarshal.Read<int>(control.Slice(60, 4));
 
                 if (width <= 0 || height <= 0)
                     continue;
@@ -154,6 +185,10 @@ public class ReplayCaptureCamera : MonoBehaviour
                     MemoryMarshal.Read<float>(control.Slice(16, 4)),
                     MemoryMarshal.Read<float>(control.Slice(20, 4)),
                     MemoryMarshal.Read<float>(control.Slice(24, 4)));
+
+                _captureFrames++;
+                if (_captureFrames <= 3 || _captureFrames % 120 == 0)
+                    Debug.Log($"[ReplayCapture] Pose frame={_captureFrames} version={version} readPos=({pos.x:F3}, {pos.y:F3}, {pos.z:F3}) readRot=({rot.x:F3}, {rot.y:F3}, {rot.z:F3}, {rot.w:F3})");
 
                 if (width != _width || height != _height)
                     ResizeBuffers(width, height);
@@ -175,17 +210,34 @@ public class ReplayCaptureCamera : MonoBehaviour
                     RenderEquirect(width, height, projection, clearMode);
 
                 var totalSize = width * height * 4;
-                var target = rm.SharedMemory.AccessData<byte>(new SharedMemoryBufferDescriptor<byte>
-                {
-                    bufferId = RenderBufferId,
-                    bufferCapacity = totalSize,
-                    offset = 0,
-                    length = totalSize,
-                });
-
                 var data = _readbackTex.GetRawTextureData();
                 if (data.Length == totalSize)
+                {
+                    var target = rm.SharedMemory.AccessData<byte>(new SharedMemoryBufferDescriptor<byte>
+                    {
+                        bufferId = RenderBufferId,
+                        bufferCapacity = totalSize,
+                        offset = 0,
+                        length = totalSize,
+                    });
                     data.AsSpan().CopyTo(target);
+                }
+
+                if (_depthOutput == DepthOutputDepthOnly || _depthOutput == DepthOutputBoth)
+                {
+                    var depthData = _depthReadbackTex.GetRawTextureData();
+                    if (depthData.Length == totalSize)
+                    {
+                        var depthTarget = rm.SharedMemory.AccessData<byte>(new SharedMemoryBufferDescriptor<byte>
+                        {
+                            bufferId = DepthBufferId,
+                            bufferCapacity = totalSize,
+                            offset = 0,
+                            length = totalSize,
+                        });
+                        depthData.AsSpan().CopyTo(depthTarget);
+                    }
+                }
             }
             catch (Exception e)
             {
@@ -236,6 +288,18 @@ public class ReplayCaptureCamera : MonoBehaviour
             Destroy(_readbackTex);
         _readbackTex = new Texture2D(width, height, UnityEngine.TextureFormat.RGBA32, false);
 
+        if (_depthOutput == DepthOutputDepthOnly || _depthOutput == DepthOutputBoth)
+        {
+            if (_depthRT != null)
+                Destroy(_depthRT);
+            _depthRT = new RenderTexture(width, height, 0, RenderTextureFormat.RFloat);
+            _depthRT.Create();
+
+            if (_depthReadbackTex != null)
+                Destroy(_depthReadbackTex);
+            _depthReadbackTex = new Texture2D(width, height, UnityEngine.TextureFormat.RFloat, false);
+        }
+
         _width = width;
         _height = height;
     }
@@ -268,12 +332,59 @@ public class ReplayCaptureCamera : MonoBehaviour
 
             RenderTexture.active = renderTex;
             _readbackTex.ReadPixels(new Rect(0, 0, width, height), 0, 0, false);
+
+            if (_depthOutput == DepthOutputDepthOnly || _depthOutput == DepthOutputBoth)
+                RenderDepth();
         }
         finally
         {
             RenderTexture.active = prevActive;
             _camera.targetTexture = null;
             RenderTexture.ReleaseTemporary(renderTex);
+        }
+    }
+
+    // Render depth by temporarily swapping every renderer's material to the depth
+    // material, rendering, then restoring. This avoids SetReplacementShader's
+    // RenderType-tag matching (which skips objects whose shader has a non-standard
+    // tag, e.g. BuiltIn/Null) and works for any material.
+    void RenderDepth()
+    {
+        if (_depthRT == null || _depthReplacementMat == null) return;
+
+        var renderers = UnityEngine.Object.FindObjectsOfType<UnityEngine.Renderer>();
+        var savedRenderers = new List<UnityEngine.Renderer>();
+        var savedMaterials = new List<Material[]>();
+        var prevActive = RenderTexture.active;
+        var prevTarget = _camera.targetTexture;
+        try
+        {
+            for (int n = 0; n < renderers.Length; n++)
+            {
+                var r = renderers[n];
+                if (!r.enabled) continue;
+                savedRenderers.Add(r);
+                savedMaterials.Add(r.sharedMaterials);
+                var depthMats = new Material[r.sharedMaterials.Length];
+                for (int i = 0; i < depthMats.Length; i++)
+                    depthMats[i] = _depthReplacementMat;
+                r.materials = depthMats;
+            }
+
+            _camera.targetTexture = _depthRT;
+            _camera.Render();
+
+            RenderTexture.active = _depthRT;
+            _depthReadbackTex.ReadPixels(new Rect(0, 0, _width, _height), 0, 0, false);
+        }
+        finally
+        {
+            for (int n = 0; n < savedRenderers.Count; n++)
+            {
+                try { savedRenderers[n].materials = savedMaterials[n]; } catch { }
+            }
+            _camera.targetTexture = prevTarget;
+            RenderTexture.active = prevActive;
         }
     }
 
@@ -312,6 +423,30 @@ public class ReplayCaptureCamera : MonoBehaviour
             _camera.aspect = 1f;
             _camera.orthographic = false;
             ApplyClear(_camera, clearMode);
+
+            // Depth cubemap: a temp face RT that we render into with depth materials.
+            var depthFaceRT = (_depthOutput == DepthOutputDepthOnly || _depthOutput == DepthOutputBoth)
+                && _depthReplacementMat != null && _depthCubeRT != null
+                ? RenderTexture.GetTemporary(cubeSize, cubeSize, 0, RenderTextureFormat.RFloat) : null;
+
+            // Swap all renderers to depth material for the depth faces (avoids
+            // SetReplacementShader's RenderType-tag matching).
+            var renderers = depthFaceRT != null ? UnityEngine.Object.FindObjectsOfType<UnityEngine.Renderer>() : null;
+            var eqSavedRenderers = new List<UnityEngine.Renderer>();
+            var eqSavedMaterials = new List<Material[]>();
+            if (renderers != null)
+            {
+                for (int n = 0; n < renderers.Length; n++)
+                {
+                    var r = renderers[n];
+                    if (!r.enabled) continue;
+                    eqSavedRenderers.Add(r);
+                    eqSavedMaterials.Add(r.sharedMaterials);
+                    var dm = new Material[r.sharedMaterials.Length];
+                    for (int i = 0; i < dm.Length; i++) dm[i] = _depthReplacementMat;
+                    r.materials = dm;
+                }
+            }
             try
             {
                 for (int f = 0; f < 6; f++)
@@ -319,10 +454,24 @@ public class ReplayCaptureCamera : MonoBehaviour
                     _camera.transform.rotation = prevRot * Quaternion.Euler(FaceEulerAngles[f]);
                     _camera.Render();
                     Graphics.CopyTexture(faceRT, 0, 0, _cubeRT, f, 0);
+
+                    // Per-face depth into the depth cubemap.
+                    if (depthFaceRT != null)
+                    {
+                        _camera.targetTexture = depthFaceRT;
+                        _camera.Render();
+                        _camera.targetTexture = faceRT;
+                        Graphics.CopyTexture(depthFaceRT, 0, 0, _depthCubeRT, f, 0);
+                    }
                 }
             }
             finally
             {
+                for (int n = 0; n < eqSavedRenderers.Count; n++)
+                {
+                    try { eqSavedRenderers[n].materials = eqSavedMaterials[n]; } catch { }
+                }
+                if (depthFaceRT != null) RenderTexture.ReleaseTemporary(depthFaceRT);
                 RenderTexture.ReleaseTemporary(faceRT);
             }
 
@@ -332,6 +481,21 @@ public class ReplayCaptureCamera : MonoBehaviour
             if (haveMat)
                 Graphics.Blit(Texture2D.whiteTexture, _outputRT, projMat);
             _readbackTex.ReadPixels(new Rect(0, 0, width, height), 0, 0, false);
+
+            // Depth projection pass: project the depth cubemap to the depth output RT, then read back.
+            if (_depthOutput == DepthOutputDepthOnly || _depthOutput == DepthOutputBoth)
+            {
+                if (haveMat && _depthCubeRT != null && _depthOutputRT != null)
+                {
+                    projMat.SetTexture(_cubeId, _depthCubeRT);
+                    RenderTexture.active = _depthOutputRT;
+                    GL.Clear(true, true, Color.black);
+                    Graphics.Blit(Texture2D.whiteTexture, _depthOutputRT, projMat);
+                    _depthReadbackTex.ReadPixels(new Rect(0, 0, width, height), 0, 0, false);
+                    projMat.SetTexture(_cubeId, _cubeRT);
+                    RenderTexture.active = prevActive;
+                }
+            }
         }
         finally
         {
@@ -365,14 +529,41 @@ public class ReplayCaptureCamera : MonoBehaviour
             _outputRT = new RenderTexture(width, height, 0, RenderTextureFormat.ARGB32);
             _outputRT.Create();
         }
+
+        bool wantDepth = _depthOutput == DepthOutputDepthOnly || _depthOutput == DepthOutputBoth;
+        if (wantDepth)
+        {
+            if (_depthCubeRT == null || _depthCubeRT.width != cubeSize)
+            {
+                if (_depthCubeRT != null)
+                    Destroy(_depthCubeRT);
+                _depthCubeRT = new RenderTexture(cubeSize, cubeSize, 0, RenderTextureFormat.RFloat)
+                {
+                    dimension = UnityEngine.Rendering.TextureDimension.Cube,
+                };
+                _depthCubeRT.Create();
+            }
+
+            if (_depthOutputRT == null || _depthOutputRT.width != width || _depthOutputRT.height != height)
+            {
+                if (_depthOutputRT != null)
+                    Destroy(_depthOutputRT);
+                _depthOutputRT = new RenderTexture(width, height, 0, RenderTextureFormat.RFloat);
+                _depthOutputRT.Create();
+            }
+        }
     }
 
     void OnDestroy()
     {
         if (_readbackTex != null) Destroy(_readbackTex);
+        if (_depthReadbackTex != null) Destroy(_depthReadbackTex);
         if (_cubeRT != null) Destroy(_cubeRT);
+        if (_depthCubeRT != null) Destroy(_depthCubeRT);
         if (_outputRT != null) Destroy(_outputRT);
+        if (_depthOutputRT != null) Destroy(_depthOutputRT);
         if (_projectMat != null) Destroy(_projectMat);
         if (_projectMat180 != null) Destroy(_projectMat180);
+        if (_depthReplacementMat != null) Destroy(_depthReplacementMat);
     }
 }
