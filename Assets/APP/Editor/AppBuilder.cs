@@ -47,10 +47,26 @@ public class AppBuilder
             UnityEngine.Debug.Log($"Compiling with UMP support: OFF");
     }
 
+    // CLI: & Unity.exe ... -executeMethod AppBuilder.BuildWindows -buildOutputPath D:\out\Renderer
+    static string ResolveOutputPath(string defaultPath)
+    {
+        var args = Environment.GetCommandLineArgs();
+        for (int i = 0; i < args.Length - 1; i++)
+        {
+            if (args[i] == "-buildOutputPath")
+            {
+                var path = Path.GetFullPath(args[i + 1]);
+                UnityEngine.Debug.Log($"Build output path overridden to: {path}");
+                return path;
+            }
+        }
+        return defaultPath;
+    }
+
     [MenuItem("Build/Windows")]
     public static void BuildWindows()
     {
-        BuildWindows(WindowsRoot, ScriptingImplementation.Mono2x);
+        BuildWindows(ResolveOutputPath(WindowsRoot), ScriptingImplementation.Mono2x);
     }
 
     [MenuItem("Build/Windows (IL2CPP) - Release")]
@@ -105,7 +121,7 @@ public class AppBuilder
     {
         UpdateVersionInfo();
 
-        var path = WindowsDebugRoot;
+        var path = ResolveOutputPath(WindowsDebugRoot);
 
         var executable = Path.Combine(path, $"{AppName}.exe");
         var dataFolder = Path.Combine(path, $"{AppName}_Data");
