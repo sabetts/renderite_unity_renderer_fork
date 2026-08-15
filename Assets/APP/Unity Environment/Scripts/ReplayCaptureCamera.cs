@@ -22,7 +22,10 @@ public class ReplayCaptureCamera : MonoBehaviour
     const int ControlBufferId = int.MaxValue - 2;
     const int RenderBufferId = int.MaxValue - 1;
     const int DepthBufferId = int.MaxValue - 3;
-    const int ControlBlockSize = 64;
+    const int SemanticBufferId = int.MaxValue - 4;
+    // Shared memory capacities must be multiples of 8 (Cloudtoid requirement).
+    // semanticOutput lives at offset 64; bytes 68-71 are padding.
+    const int ControlBlockSize = 72;
 
     const int ProjectionPerspective = 0;
     const int ProjectionEquirect360 = 1;
@@ -32,6 +35,10 @@ public class ReplayCaptureCamera : MonoBehaviour
     const int DepthOutputNone = 0;
     const int DepthOutputDepthOnly = 1;
     const int DepthOutputBoth = 2;
+
+    // Encoded mesh-asset-id denominator. assetId / 65536f is exact for ids < 2^24,
+    // matching the readback RFloat precision.
+    const float SemanticIdScale = 65536f;
 
     Camera _camera;
     Texture2D _readbackTex;
@@ -56,6 +63,16 @@ public class ReplayCaptureCamera : MonoBehaviour
     Material _depthReplacementMat;
     Texture2D _depthReadbackTex;
     int _depthOutput;
+
+    // Semantic segmentation output: same material-swap approach as depth, but each
+    // renderer is swapped to a per-asset-id flat material so pixels carry their mesh
+    // asset id (encoded as id / 65536f) instead of depth. Read back to SemanticBufferId.
+    RenderTexture _semanticRT;
+    Texture2D _semanticReadbackTex;
+    Material _semanticReplacementMat;
+    readonly Dictionary<float, Material> _semanticMatCache = new Dictionary<float, Material>();
+    int _semanticValueId;
+    int _semanticOutput;
 
     // Camera rotation (euler angles) per cubemap face so each face can be rendered
     // with a plain Camera.Render() call (RenderToCubemap is unreliable in this player).
@@ -136,6 +153,19 @@ public class ReplayCaptureCamera : MonoBehaviour
             _depthReplacementMat = new Material(depthShader);
         }
 
+        // Semantic replacement shader: renders all scene objects with a flat color
+        // carrying their encoded mesh asset id.
+        var semanticShader = Resources.Load<Shader>("ReplaySemanticReplacement");
+        if (semanticShader == null)
+        {
+            Debug.LogError("[ReplayCapture] Shader ReplaySemanticReplacement not found in resources");
+        }
+        else
+        {
+            _semanticReplacementMat = new Material(semanticShader);
+            _semanticValueId = Shader.PropertyToID("_SemanticId");
+        }
+
         StartCoroutine(CaptureLoop());
     }
 
@@ -172,6 +202,7 @@ public class ReplayCaptureCamera : MonoBehaviour
                 float far = MemoryMarshal.Read<float>(control.Slice(52, 4));
                 int clearMode = MemoryMarshal.Read<int>(control.Slice(56, 4));
                 _depthOutput = MemoryMarshal.Read<int>(control.Slice(60, 4));
+                _semanticOutput = MemoryMarshal.Read<int>(control.Slice(64, 4));
 
                 if (width <= 0 || height <= 0)
                     continue;
@@ -238,6 +269,22 @@ public class ReplayCaptureCamera : MonoBehaviour
                         depthData.AsSpan().CopyTo(depthTarget);
                     }
                 }
+
+                if (_semanticOutput != 0 && _semanticReadbackTex != null)
+                {
+                    var semanticData = _semanticReadbackTex.GetRawTextureData();
+                    if (semanticData.Length == totalSize)
+                    {
+                        var semanticTarget = rm.SharedMemory.AccessData<byte>(new SharedMemoryBufferDescriptor<byte>
+                        {
+                            bufferId = SemanticBufferId,
+                            bufferCapacity = totalSize,
+                            offset = 0,
+                            length = totalSize,
+                        });
+                        semanticData.AsSpan().CopyTo(semanticTarget);
+                    }
+                }
             }
             catch (Exception e)
             {
@@ -292,12 +339,24 @@ public class ReplayCaptureCamera : MonoBehaviour
         {
             if (_depthRT != null)
                 Destroy(_depthRT);
-            _depthRT = new RenderTexture(width, height, 0, RenderTextureFormat.RFloat);
+            _depthRT = new RenderTexture(width, height, 24, RenderTextureFormat.RFloat);
             _depthRT.Create();
 
             if (_depthReadbackTex != null)
                 Destroy(_depthReadbackTex);
             _depthReadbackTex = new Texture2D(width, height, UnityEngine.TextureFormat.RFloat, false);
+        }
+
+        if (_semanticOutput != 0 && _semanticReplacementMat != null)
+        {
+            if (_semanticRT != null)
+                Destroy(_semanticRT);
+            _semanticRT = new RenderTexture(width, height, 24, RenderTextureFormat.RFloat);
+            _semanticRT.Create();
+
+            if (_semanticReadbackTex != null)
+                Destroy(_semanticReadbackTex);
+            _semanticReadbackTex = new Texture2D(width, height, UnityEngine.TextureFormat.RFloat, false);
         }
 
         _width = width;
@@ -335,6 +394,9 @@ public class ReplayCaptureCamera : MonoBehaviour
 
             if (_depthOutput == DepthOutputDepthOnly || _depthOutput == DepthOutputBoth)
                 RenderDepth();
+
+            if (_semanticOutput != 0)
+                RenderSemanticMap();
         }
         finally
         {
@@ -376,6 +438,61 @@ public class ReplayCaptureCamera : MonoBehaviour
 
             RenderTexture.active = _depthRT;
             _depthReadbackTex.ReadPixels(new Rect(0, 0, _width, _height), 0, 0, false);
+        }
+        finally
+        {
+            for (int n = 0; n < savedRenderers.Count; n++)
+            {
+                try { savedRenderers[n].materials = savedMaterials[n]; } catch { }
+            }
+            _camera.targetTexture = prevTarget;
+            RenderTexture.active = prevActive;
+        }
+    }
+
+    // Render semantic segmentation by swapping every renderer's material to a flat
+    // per-mesh-asset-id material, rendering, then restoring. Perspective only for now;
+    // equirect will mirror the depth cubemap path later. The encoded id (assetId /
+    // 65536f) is exact for ids < 2^24, which covers all engine AssetIds in practice.
+    void RenderSemanticMap()
+    {
+        if (_semanticRT == null || _semanticReplacementMat == null) return;
+
+        var renderers = UnityEngine.Object.FindObjectsOfType<UnityEngine.Renderer>();
+        var savedRenderers = new List<UnityEngine.Renderer>();
+        var savedMaterials = new List<Material[]>();
+        var prevActive = RenderTexture.active;
+        var prevTarget = _camera.targetTexture;
+        try
+        {
+            for (int n = 0; n < renderers.Length; n++)
+            {
+                var r = renderers[n];
+                if (!r.enabled) continue;
+                savedRenderers.Add(r);
+                savedMaterials.Add(r.sharedMaterials);
+
+                float encodedId = 0f;
+                if (MeshAssetIdRegistry.TryGetMeshAssetId(r, out int meshAssetId) && meshAssetId >= 0)
+                    encodedId = meshAssetId / SemanticIdScale;
+
+                if (!_semanticMatCache.TryGetValue(encodedId, out var mat))
+                {
+                    mat = new Material(_semanticReplacementMat);
+                    mat.SetFloat(_semanticValueId, encodedId);
+                    _semanticMatCache[encodedId] = mat;
+                }
+                var semanticMats = new Material[r.sharedMaterials.Length];
+                for (int i = 0; i < semanticMats.Length; i++)
+                    semanticMats[i] = mat;
+                r.materials = semanticMats;
+            }
+
+            _camera.targetTexture = _semanticRT;
+            _camera.Render();
+
+            RenderTexture.active = _semanticRT;
+            _semanticReadbackTex.ReadPixels(new Rect(0, 0, _width, _height), 0, 0, false);
         }
         finally
         {
@@ -558,12 +675,15 @@ public class ReplayCaptureCamera : MonoBehaviour
     {
         if (_readbackTex != null) Destroy(_readbackTex);
         if (_depthReadbackTex != null) Destroy(_depthReadbackTex);
+        if (_semanticReadbackTex != null) Destroy(_semanticReadbackTex);
         if (_cubeRT != null) Destroy(_cubeRT);
         if (_depthCubeRT != null) Destroy(_depthCubeRT);
         if (_outputRT != null) Destroy(_outputRT);
         if (_depthOutputRT != null) Destroy(_depthOutputRT);
+        if (_semanticRT != null) Destroy(_semanticRT);
         if (_projectMat != null) Destroy(_projectMat);
         if (_projectMat180 != null) Destroy(_projectMat180);
         if (_depthReplacementMat != null) Destroy(_depthReplacementMat);
+        if (_semanticReplacementMat != null) Destroy(_semanticReplacementMat);
     }
 }
