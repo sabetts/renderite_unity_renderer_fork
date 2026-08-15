@@ -544,7 +544,7 @@ public class ReplayCaptureCamera : MonoBehaviour
             // Depth cubemap: a temp face RT that we render into with depth materials.
             var depthFaceRT = (_depthOutput == DepthOutputDepthOnly || _depthOutput == DepthOutputBoth)
                 && _depthReplacementMat != null && _depthCubeRT != null
-                ? RenderTexture.GetTemporary(cubeSize, cubeSize, 0, RenderTextureFormat.RFloat) : null;
+                ? RenderTexture.GetTemporary(cubeSize, cubeSize, 24, RenderTextureFormat.RFloat) : null;
 
             // Swap all renderers to depth material for the depth faces (avoids
             // SetReplacementShader's RenderType-tag matching).
