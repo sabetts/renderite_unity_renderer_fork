@@ -68,6 +68,8 @@ public class ReplayCaptureCamera : MonoBehaviour
     // renderer is swapped to a per-asset-id flat material so pixels carry their mesh
     // asset id (encoded as id / 65536f) instead of depth. Read back to SemanticBufferId.
     RenderTexture _semanticRT;
+    RenderTexture _semanticCubeRT;
+    RenderTexture _semanticOutputRT;
     Texture2D _semanticReadbackTex;
     Material _semanticReplacementMat;
     readonly Dictionary<float, Material> _semanticMatCache = new Dictionary<float, Material>();
@@ -613,6 +615,70 @@ public class ReplayCaptureCamera : MonoBehaviour
                     RenderTexture.active = prevActive;
                 }
             }
+
+            // Semantic cubemap pass, mirroring the depth path: swap all renderers to
+            // per-asset-id flat materials, render the 6 faces into a temp RFloat face
+            // RT (depth 24 so overlapping projections resolve correctly), then project
+            // the cubemap to the panorama and read back.
+            if (_semanticOutput != 0 && _semanticReplacementMat != null && _semanticCubeRT != null
+                && _semanticOutputRT != null && _semanticReadbackTex != null)
+            {
+                var semanticFaceRT = RenderTexture.GetTemporary(cubeSize, cubeSize, 24, RenderTextureFormat.RFloat);
+                var semRenderers = UnityEngine.Object.FindObjectsOfType<UnityEngine.Renderer>();
+                var semSavedRenderers = new List<UnityEngine.Renderer>();
+                var semSavedMaterials = new List<Material[]>();
+                try
+                {
+                    for (int n = 0; n < semRenderers.Length; n++)
+                    {
+                        var r = semRenderers[n];
+                        if (!r.enabled) continue;
+                        semSavedRenderers.Add(r);
+                        semSavedMaterials.Add(r.sharedMaterials);
+
+                        float encodedId = 0f;
+                        if (MeshAssetIdRegistry.TryGetMeshAssetId(r, out int meshAssetId) && meshAssetId >= 0)
+                            encodedId = meshAssetId / SemanticIdScale;
+
+                        if (!_semanticMatCache.TryGetValue(encodedId, out var mat))
+                        {
+                            mat = new Material(_semanticReplacementMat);
+                            mat.SetFloat(_semanticValueId, encodedId);
+                            _semanticMatCache[encodedId] = mat;
+                        }
+                        var dm = new Material[r.sharedMaterials.Length];
+                        for (int i = 0; i < dm.Length; i++) dm[i] = mat;
+                        r.materials = dm;
+                    }
+
+                    for (int f = 0; f < 6; f++)
+                    {
+                        _camera.transform.rotation = prevRot * Quaternion.Euler(FaceEulerAngles[f]);
+                        _camera.targetTexture = semanticFaceRT;
+                        _camera.Render();
+                        Graphics.CopyTexture(semanticFaceRT, 0, 0, _semanticCubeRT, f, 0);
+                    }
+                }
+                finally
+                {
+                    for (int n = 0; n < semSavedRenderers.Count; n++)
+                    {
+                        try { semSavedRenderers[n].materials = semSavedMaterials[n]; } catch { }
+                    }
+                    RenderTexture.ReleaseTemporary(semanticFaceRT);
+                }
+
+                if (haveMat)
+                {
+                    projMat.SetTexture(_cubeId, _semanticCubeRT);
+                    RenderTexture.active = _semanticOutputRT;
+                    GL.Clear(true, true, Color.black);
+                    Graphics.Blit(Texture2D.whiteTexture, _semanticOutputRT, projMat);
+                    _semanticReadbackTex.ReadPixels(new Rect(0, 0, width, height), 0, 0, false);
+                    projMat.SetTexture(_cubeId, _cubeRT);
+                    RenderTexture.active = prevActive;
+                }
+            }
         }
         finally
         {
@@ -669,6 +735,30 @@ public class ReplayCaptureCamera : MonoBehaviour
                 _depthOutputRT.Create();
             }
         }
+
+        bool wantSemantic = _semanticOutput != 0;
+        if (wantSemantic)
+        {
+            if (_semanticCubeRT == null || _semanticCubeRT.width != cubeSize)
+            {
+                if (_semanticCubeRT != null)
+                    Destroy(_semanticCubeRT);
+                _semanticCubeRT = new RenderTexture(cubeSize, cubeSize, 0, RenderTextureFormat.RFloat)
+                {
+                    dimension = UnityEngine.Rendering.TextureDimension.Cube,
+                };
+                _semanticCubeRT.filterMode = FilterMode.Point;
+                _semanticCubeRT.Create();
+            }
+
+            if (_semanticOutputRT == null || _semanticOutputRT.width != width || _semanticOutputRT.height != height)
+            {
+                if (_semanticOutputRT != null)
+                    Destroy(_semanticOutputRT);
+                _semanticOutputRT = new RenderTexture(width, height, 0, RenderTextureFormat.RFloat);
+                _semanticOutputRT.Create();
+            }
+        }
     }
 
     void OnDestroy()
@@ -681,6 +771,8 @@ public class ReplayCaptureCamera : MonoBehaviour
         if (_outputRT != null) Destroy(_outputRT);
         if (_depthOutputRT != null) Destroy(_depthOutputRT);
         if (_semanticRT != null) Destroy(_semanticRT);
+        if (_semanticCubeRT != null) Destroy(_semanticCubeRT);
+        if (_semanticOutputRT != null) Destroy(_semanticOutputRT);
         if (_projectMat != null) Destroy(_projectMat);
         if (_projectMat180 != null) Destroy(_projectMat180);
         if (_depthReplacementMat != null) Destroy(_depthReplacementMat);
