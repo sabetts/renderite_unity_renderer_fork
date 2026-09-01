@@ -435,6 +435,11 @@ public class ReplayCaptureCamera : MonoBehaviour
                 r.materials = depthMats;
             }
 
+            // Depth/semantic passes must not inherit the color pass's skybox clear
+            // (the skybox would render into the RFloat buffer as garbage floats).
+            // Force a solid-black clear so the background stays the 0.0 sentinel.
+            _camera.clearFlags = CameraClearFlags.SolidColor;
+            _camera.backgroundColor = Color.black;
             _camera.targetTexture = _depthRT;
             _camera.Render();
 
@@ -490,6 +495,8 @@ public class ReplayCaptureCamera : MonoBehaviour
                 r.materials = semanticMats;
             }
 
+            _camera.clearFlags = CameraClearFlags.SolidColor;
+            _camera.backgroundColor = Color.black;
             _camera.targetTexture = _semanticRT;
             _camera.Render();
 
@@ -571,12 +578,17 @@ public class ReplayCaptureCamera : MonoBehaviour
                 for (int f = 0; f < 6; f++)
                 {
                     _camera.transform.rotation = prevRot * Quaternion.Euler(FaceEulerAngles[f]);
+                    ApplyClear(_camera, clearMode);
                     _camera.Render();
                     Graphics.CopyTexture(faceRT, 0, 0, _cubeRT, f, 0);
 
-                    // Per-face depth into the depth cubemap.
+                    // Per-face depth into the depth cubemap. Force a solid-black
+                    // clear so the skybox doesn't render into the RFloat depth
+                    // buffer (its color would read back as garbage floats).
                     if (depthFaceRT != null)
                     {
+                        _camera.clearFlags = CameraClearFlags.SolidColor;
+                        _camera.backgroundColor = Color.black;
                         _camera.targetTexture = depthFaceRT;
                         _camera.Render();
                         _camera.targetTexture = faceRT;
@@ -654,6 +666,8 @@ public class ReplayCaptureCamera : MonoBehaviour
                     for (int f = 0; f < 6; f++)
                     {
                         _camera.transform.rotation = prevRot * Quaternion.Euler(FaceEulerAngles[f]);
+                        _camera.clearFlags = CameraClearFlags.SolidColor;
+                        _camera.backgroundColor = Color.black;
                         _camera.targetTexture = semanticFaceRT;
                         _camera.Render();
                         Graphics.CopyTexture(semanticFaceRT, 0, 0, _semanticCubeRT, f, 0);
