@@ -24,7 +24,7 @@ public class ReplayCaptureCamera : MonoBehaviour
     const int DepthBufferId = int.MaxValue - 3;
     const int SemanticBufferId = int.MaxValue - 4;
     // Shared memory capacities must be multiples of 8 (Cloudtoid requirement).
-    // semanticOutput lives at offset 64; bytes 68-71 are padding.
+    // semanticOutput lives at offset 64; bytes 68-71 carry the dashboard flag.
     const int ControlBlockSize = 72;
 
     const int ProjectionPerspective = 0;
@@ -41,6 +41,15 @@ public class ReplayCaptureCamera : MonoBehaviour
     const float SemanticIdScale = 65536f;
 
     Camera _camera;
+    // Orthographic pass mirroring the on-screen OverlayCamera: renders only the
+    // Overlay layer (dashboard/escape menu, desktop cursor) over the perspective
+    // scene output, reproducing the live window composite in the capture.
+    Camera _overlayCam;
+    // The renderer's own on-screen OverlayCamera scene object. We copy its transform
+    // (fixed world (0,0,-10) in Engine.unity — it does not track the head) so the
+    // composite matches the replay window exactly instead of following the capture
+    // camera pose.
+    Camera _sceneOverlayCam;
     Texture2D _readbackTex;
     RenderTexture _cubeRT;
     RenderTexture _outputRT;
@@ -52,7 +61,9 @@ public class ReplayCaptureCamera : MonoBehaviour
     int _lastVersion = -1;
     int _width = -1;
     int _height = -1;
+    int _dashboardOutput = 1;
     bool _diagLogged;
+    bool _overlayDiagLogged;
     int _captureFrames;
 
     // Depth output: render the scene with a replacement shader that outputs Linear01Depth,
@@ -108,6 +119,21 @@ public class ReplayCaptureCamera : MonoBehaviour
         // Mirror the renderer's on-screen camera (CameraInitializer.cs): everything
         // except Hidden/Overlay, i.e. Default + Temp + Private are all visible.
         _camera.cullingMask = ~LayerMask.GetMask(RenderHelper.HIDDEN_LAYER, RenderHelper.OVERLAY_LAYER);
+
+        // Overlay pass camera, mirroring the on-screen OverlayCamera (Engine.unity):
+        // orthographic, size 0.5, only the Overlay layer, depth-only clear so the
+        // dashboard composites over the perspective scene without erasing it.
+        var overlayGo = new GameObject("ReplayCaptureOverlayCam");
+        overlayGo.transform.SetParent(transform, false);
+        _overlayCam = overlayGo.AddComponent<Camera>();
+        _overlayCam.enabled = false;
+        _overlayCam.stereoTargetEye = StereoTargetEyeMask.None;
+        _overlayCam.orthographic = true;
+        _overlayCam.orthographicSize = 0.5f;
+        _overlayCam.nearClipPlane = 0.1f;
+        _overlayCam.farClipPlane = 20f;
+        _overlayCam.cullingMask = 1 << LayerMask.NameToLayer(RenderHelper.OVERLAY_LAYER);
+        _overlayCam.clearFlags = CameraClearFlags.Depth;
 
         _cubeId = Shader.PropertyToID("_Cube");
         _rotationId = Shader.PropertyToID("_Rotation");
@@ -205,6 +231,7 @@ public class ReplayCaptureCamera : MonoBehaviour
                 int clearMode = MemoryMarshal.Read<int>(control.Slice(56, 4));
                 _depthOutput = MemoryMarshal.Read<int>(control.Slice(60, 4));
                 _semanticOutput = MemoryMarshal.Read<int>(control.Slice(64, 4));
+                _dashboardOutput = MemoryMarshal.Read<int>(control.Slice(68, 4));
 
                 if (width <= 0 || height <= 0)
                     continue;
@@ -235,6 +262,14 @@ public class ReplayCaptureCamera : MonoBehaviour
                 {
                     _diagLogged = true;
                     LogCaptureDiagnostics();
+                }
+
+                // Once the dashboard's Overlay-layer renderers actually exist in the
+                // replay scene, dump them once so we can verify where they sit.
+                if (!_overlayDiagLogged && FindOverlayRenderer() != null)
+                {
+                    _overlayDiagLogged = true;
+                    LogOverlayDiagnostics();
                 }
 
                 if (projection == ProjectionPerspective)
@@ -331,6 +366,63 @@ public class ReplayCaptureCamera : MonoBehaviour
         }
     }
 
+    UnityEngine.Renderer FindOverlayRenderer()
+    {
+        foreach (var mr in UnityEngine.Object.FindObjectsOfType<UnityEngine.Renderer>())
+        {
+            if (mr != null && mr.gameObject.layer == LayerMask.NameToLayer(RenderHelper.OVERLAY_LAYER))
+                return mr;
+        }
+        return null;
+    }
+
+    RenderSpace FindOverlayRenderSpace()
+    {
+        foreach (var rs in UnityEngine.Object.FindObjectsOfType<RenderSpace>())
+        {
+            if (rs != null && rs.IsOverlay)
+                return rs;
+        }
+        return null;
+    }
+
+    void LogOverlayDiagnostics()
+    {
+        try
+        {
+            var layer = LayerMask.NameToLayer(RenderHelper.OVERLAY_LAYER);
+            if (_sceneOverlayCam == null)
+                _sceneOverlayCam = GameObject.Find("OverlayCamera")?.GetComponent<Camera>();
+            string sceneOverlay = _sceneOverlayCam != null
+                ? $"sceneOverlayCam pos={_sceneOverlayCam.transform.position} rot={_sceneOverlayCam.transform.eulerAngles}"
+                : "sceneOverlayCam=null (using captured pose)";
+            Debug.Log($"[ReplayCapture] DIAG overlay frame={Time.frameCount} overlayCam pos={_overlayCam.transform.position} rot={_overlayCam.transform.eulerAngles} {sceneOverlay}");
+            var overlaySpace = FindOverlayRenderSpace();
+            if (overlaySpace != null)
+                Debug.Log($"[ReplayCapture] DIAG overlay root pos={overlaySpace.transform.position} rot={overlaySpace.transform.eulerAngles} active={overlaySpace.IsActive}");
+            else
+                Debug.Log("[ReplayCapture] DIAG overlay root not found");
+            int found = 0;
+            foreach (var mr in UnityEngine.Object.FindObjectsOfType<UnityEngine.Renderer>())
+            {
+                if (mr == null || mr.gameObject.layer != layer)
+                    continue;
+                var filter = mr.GetComponent<MeshFilter>();
+                int verts = filter != null && filter.sharedMesh != null ? filter.sharedMesh.vertexCount : -1;
+                var b = mr.bounds;
+                var mat = mr.sharedMaterial;
+                Debug.Log($"[ReplayCapture] DIAG overlay renderer name={mr.gameObject.name} type={mr.GetType().Name} layer={mr.gameObject.layer} enabled={mr.enabled} mat={(mat != null ? mat.name + " shader=" + mat.shader?.name : "NULL")} pos={mr.transform.position} rot={mr.transform.eulerAngles} boundsC={b.center} size={b.size} verts={verts}");
+                found++;
+            }
+            if (found == 0)
+                Debug.Log("[ReplayCapture] DIAG overlay no Overlay-layer Renderers found");
+        }
+        catch (Exception e)
+        {
+            Debug.LogError("[ReplayCapture] DIAG overlay failed: " + e);
+        }
+    }
+
     void ResizeBuffers(int width, int height)
     {
         if (_readbackTex != null)
@@ -390,6 +482,32 @@ public class ReplayCaptureCamera : MonoBehaviour
             _camera.targetTexture = renderTex;
             ApplyClear(_camera, clearMode);
             _camera.Render();
+
+            // Composite the dashboard/overlay UI (Overlay layer only) on top of the
+            // perspective scene, mirroring the on-screen OverlayCamera. Depth-only
+            // clear leaves the scene behind; pixels the overlay covers win.
+            // The overlay content is pinned to the active world-space root (near the
+            // scene origin), and the on-screen OverlayCamera views it from its fixed
+            // world transform ((0,0,-10) in Engine.unity) — it does NOT track the
+            // head. Copy that transform so the capture matches the replay window.
+            if (_dashboardOutput != 0 && _overlayCam != null)
+            {
+                if (_sceneOverlayCam == null)
+                    _sceneOverlayCam = GameObject.Find("OverlayCamera")?.GetComponent<Camera>();
+                if (_sceneOverlayCam != null)
+                {
+                    var t = _sceneOverlayCam.transform;
+                    _overlayCam.transform.SetPositionAndRotation(t.position, t.rotation);
+                }
+                else
+                {
+                    // Engine.unity default: fixed world (0,0,-10), identity rotation
+                    _overlayCam.transform.SetPositionAndRotation(new Vector3(0f, 0f, -10f), Quaternion.identity);
+                }
+                _overlayCam.targetTexture = renderTex;
+                _overlayCam.Render();
+                _overlayCam.targetTexture = null;
+            }
 
             RenderTexture.active = renderTex;
             _readbackTex.ReadPixels(new Rect(0, 0, width, height), 0, 0, false);
